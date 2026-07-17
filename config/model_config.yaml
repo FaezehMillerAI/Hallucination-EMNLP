@@ -1,0 +1,7 @@
+model:
+  vlm_name: "Qwen/Qwen2-VL-2B-Instruct"  # Target model
+  hidden_size: 1536  # Hidden size of Qwen2-VL-2B
+  num_layers: 28  # Number of transformer decoder layers
+  num_heads: 12  # Number of attention heads
+  patch_size: 14  # Saliency patch size
+  dummy_mode: false  # True to use mock/simulated VLM for testing/CPU

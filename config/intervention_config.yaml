@@ -1,0 +1,6 @@
+intervention:
+  alpha: 0.8  # Visual support amplification coefficient
+  beta: 0.5   # Prior penalty coefficient
+  hallucination_threshold: 0.5  # Probability threshold to trigger intervention
+  evidence_threshold: 0.3  # Sufficiency threshold for edges
+  early_stopping_patience: 3

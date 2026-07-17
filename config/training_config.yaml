@@ -1,0 +1,12 @@
+training:
+  epochs: 10
+  batch_size: 4
+  lr: 0.0005
+  weight_decay: 0.01
+  loss_weights:
+    lambda_hall: 1.0       # Hallucination detection BCE weight
+    lambda_cause: 0.5      # Cause classification CE weight
+    lambda_evidence: 0.3   # Evidence sufficiency MSE weight
+    lambda_faith: 0.3      # Causal faithfulness MSE weight
+    lambda_local: 0.2      # Localization BCE/IoU loss weight
+    lambda_mitigation: 0.4 # Mitigation sequence loss weight

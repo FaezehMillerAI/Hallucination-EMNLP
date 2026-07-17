@@ -1,0 +1,279 @@
+import os
+import json
+import yaml
+import numpy as np
+import torch
+import torch.nn as nn
+from PIL import Image
+from datasets import load_dataset
+
+# Import modules from src
+from src.claim_parser.claim_decomposer import decompose_claims
+from src.evidence_extraction.vlm_wrapper import VLMWrapper
+from src.evidence_extraction.attention_extractor import AttentionExtractor
+from src.evidence_extraction.perturbation_engine import PerturbationEngine
+from src.evidence_extraction.evidence_graph_builder import EvidenceGraphBuilder
+
+from src.detector.hgt_model import GNNHallucinationDetector
+from src.detector.faithfulness import compute_custom_scores
+
+from src.mitigation.causal_reallocation import causal_reallocate_attention
+from src.explainability.explanation_graph import extract_minimal_subgraph
+from src.explainability.report_generator import generate_explainability_report
+from src.evaluation.metrics import compute_detection_metrics, compute_pointing_iou
+
+# RLE Helper (from quickstart)
+def rle_to_mask(rle_list, height, width):
+    import numpy as np
+    if not rle_list:
+        return Image.new("L", (width, height), 0)
+    mask_flat = np.zeros(height * width, dtype=np.uint8)
+    starts = np.array(rle_list[0::2])
+    lengths = np.array(rle_list[1::2])
+    for start, length in zip(starts, lengths):
+        mask_flat[start:start+length] = 255
+    return Image.fromarray(mask_flat.reshape((height, width)))
+
+def load_yaml(path):
+    with open(path, 'r') as f:
+        return yaml.safe_load(f)
+
+def run():
+    print("====================================================================")
+    print("Starting KG-LESS: Causal Hallucination Detection & Mitigation Pipeline")
+    print("====================================================================")
+    
+    # 1. Load Configurations
+    m_config = load_yaml("config/model_config.yaml")["model"]
+    t_config = load_yaml("config/training_config.yaml")["training"]
+    d_config = load_yaml("config/dataset_config.yaml")["dataset"]
+    i_config = load_yaml("config/intervention_config.yaml")["intervention"]
+    
+    # 2. Dual-GPU Device Mapping Strategy (Optimized for Kaggle 2x T4 GPUs)
+    vlm_device = "cpu"
+    gnn_device = "cpu"
+    
+    if torch.cuda.is_available():
+        num_gpus = torch.cuda.device_count()
+        print(f"Detected {num_gpus} GPU(s) on Kaggle:")
+        for idx in range(num_gpus):
+            print(f"  - GPU {idx}: {torch.cuda.get_device_name(idx)}")
+            
+        if num_gpus >= 2:
+            # Parallel execution mapping: VLM on GPU 0, GNN HGT on GPU 1
+            vlm_device = "cuda:0"
+            gnn_device = "cuda:1"
+            print("Mapping Strategy: Dual-GPU Partitioning")
+            print("  -> VLM operations mapped to GPU 0 (cuda:0)")
+            print("  -> GNN training & message passing mapped to GPU 1 (cuda:1)")
+        else:
+            vlm_device = "cuda:0"
+            gnn_device = "cuda:0"
+            print("Mapping Strategy: Shared Single-GPU")
+    else:
+        print("No GPU detected. Running on CPU (testing mode).")
+        m_config["dummy_mode"] = True  # Auto-fallback to mock mode on CPU to avoid crashes
+        
+    # 3. Initialize VLM and Graph Helpers
+    vlm_wrapper = VLMWrapper(
+        model_name=m_config["vlm_name"], 
+        dummy_mode=m_config["dummy_mode"], 
+        device=vlm_device
+    )
+    
+    attn_extractor = AttentionExtractor(num_layers=m_config["num_layers"], num_heads=m_config["num_heads"])
+    perturb_engine = PerturbationEngine(patch_size=m_config["patch_size"])
+    graph_builder = EvidenceGraphBuilder(hidden_dim=m_config["hidden_size"], num_layers=m_config["num_layers"])
+    
+    # 4. Load HEAL-MedVQA Dataset
+    print(f"\nLoading dataset {d_config['name']}...")
+    try:
+        dataset_dict = load_dataset(d_config["name"], d_config["train_config"])
+        train_split = dataset_dict[d_config["splits"]["train"]]
+    except Exception as e:
+        print(f"Failed to load dataset: {e}. Running with mock datasets.")
+        train_split = [{"image": Image.new("L", (100, 100), 128), "question": "Is there infiltration?", "answer": "The location of Right lower lung is at <seg>. The answer is No", "anatomy": "Right lower lung", "mask_rle": [10, 20], "mask_h": 100, "mask_w": 100, "question_type": 0}]
+        
+    print(f"Loaded dataset successfully. Split size: {len(train_split)} rows.")
+    
+    # 5. Extract Evidence and Build Graph Dataset
+    print("\nExtracting cross-modal evidence graphs...")
+    evidence_graphs = []
+    processed_samples = []
+    
+    # Run on a subset (e.g. 5 samples for quick training demonstration)
+    subset_limit = 5
+    for idx in range(min(subset_limit, len(train_split))):
+        item = train_split[idx]
+        image = item["image"]
+        question = item["question"]
+        answer = item["answer"]
+        
+        prompt = f"Question: {question} Answer: {answer}"
+        
+        # A. Split and decompose atomic claims
+        claims = decompose_claims(answer)
+        if not claims:
+            continue
+            
+        # B. Run VLM Forward pass to retrieve attentions and states
+        vlm_outputs = vlm_wrapper.process_and_forward(image, prompt)
+        
+        # C. Extract attention dynamics and cross-attentions
+        token_dynamics = attn_extractor.extract_dynamics(vlm_outputs["logits"])
+        cross_atts = attn_extractor.extract_cross_attention(vlm_outputs["attentions"], num_patches=196)
+        
+        # D. Build PyG HeteroData evidence graph
+        graph = graph_builder.build_graph(vlm_outputs, claims, token_dynamics, cross_atts)
+        
+        # Compute custom faithfulness scores (for pseudo-labeling)
+        scores = compute_custom_scores(claims, vlm_outputs, cross_atts)
+        
+        # Compute counterfactual faithfulness via image perturbation
+        for c_idx, claim in enumerate(claims):
+            supportive_patches = [item[1] for item in graph["claim", "grounded_in", "visualpatch"].edge_index.t().tolist() if item[0] == c_idx]
+            faith_cf = perturb_engine.compute_faithfulness_score(vlm_wrapper, image, prompt, claim["token_span"], supportive_patches)
+            scores[c_idx]["counterfactual_consistency"] = faith_cf
+            
+        evidence_graphs.append(graph)
+        processed_samples.append({
+            "image": image,
+            "prompt": prompt,
+            "claims": claims,
+            "scores": scores,
+            "raw_item": item
+        })
+        print(f"  - Sample {idx+1}/{subset_limit} graph constructed: {len(claims)} atomic claims.")
+        
+    if not evidence_graphs:
+        print("No evidence graphs were successfully constructed. Exiting.")
+        return
+        
+    # 6. Initialize GNN HGT Detector on GNN designated device (GPU 1 / cuda:1)
+    metadata = evidence_graphs[0].metadata()
+    detector = GNNHallucinationDetector(
+        metadata=metadata,
+        hidden_channels=128,
+        num_heads=4,
+        num_layers=2
+    ).to(gnn_device)
+    
+    optimizer = torch.optim.AdamW(detector.parameters(), lr=t_config["lr"], weight_decay=t_config["weight_decay"])
+    
+    # 7. GNN Detector Training (Multi-Task Loss Optimization)
+    print(f"\nTraining GNN HGT Detector on {gnn_device} for {t_config['epochs']} epochs...")
+    detector.train()
+    
+    lambda_hall = t_config["loss_weights"]["lambda_hall"]
+    lambda_cause = t_config["loss_weights"]["lambda_cause"]
+    lambda_evidence = t_config["loss_weights"]["lambda_evidence"]
+    lambda_faith = t_config["loss_weights"]["lambda_faith"]
+    lambda_local = t_config["loss_weights"]["lambda_local"]
+    
+    for epoch in range(t_config["epochs"]):
+        epoch_loss = 0.0
+        for graph_idx, graph in enumerate(evidence_graphs):
+            # Move graph parameters to GPU 1 / cuda:1 for GNN HGT forward/backward passes
+            graph = graph.to(gnn_device)
+            optimizer.zero_grad()
+            
+            # Forward pass
+            preds = detector(graph.x_dict, graph.edge_index_dict)
+            
+            # Pseudo-labeling target variables
+            num_claims = graph["claim"].x.shape[0]
+            scores_list = processed_samples[graph_idx]["scores"]
+            
+            # Parse targets
+            target_hall = torch.tensor([1.0 if s["visual_support"] < 0.25 else 0.0 for s in scores_list], dtype=torch.float32, device=gnn_device).unsqueeze(-1)
+            target_cause = torch.tensor([2 if s["visual_support"] < 0.25 and s["prior_dominance"] > 0.5 else 0 for s in scores_list], dtype=torch.long, device=gnn_device)
+            target_suff = torch.tensor([s["visual_support"] for s in scores_list], dtype=torch.float32, device=gnn_device).unsqueeze(-1)
+            target_faith = torch.tensor([s["counterfactual_consistency"] for s in scores_list], dtype=torch.float32, device=gnn_device).unsqueeze(-1)
+            target_local = torch.tensor([s["trajectory_stability"] for s in scores_list], dtype=torch.float32, device=gnn_device).unsqueeze(-1)
+            
+            # Loss computations
+            loss_hall = nn.BCEWithLogitsLoss()(preds["hallucination"], target_hall)
+            loss_cause = nn.CrossEntropyLoss()(preds["cause"], target_cause)
+            loss_suff = nn.MSELoss()(preds["sufficiency"], target_suff)
+            loss_faith = nn.MSELoss()(preds["faithfulness"], target_faith)
+            loss_local = nn.MSELoss()(preds["localization"], target_local)
+            
+            # Multi-Task loss aggregation
+            total_loss = (
+                lambda_hall * loss_hall +
+                lambda_cause * loss_cause +
+                lambda_evidence * loss_suff +
+                lambda_faith * loss_faith +
+                lambda_local * loss_local
+            )
+            
+            total_loss.backward()
+            optimizer.step()
+            epoch_loss += total_loss.item()
+            
+        print(f"  Epoch {epoch+1:02d}/{t_config['epochs']} | Loss: {epoch_loss/len(evidence_graphs):.4f}")
+        
+    # 8. Evaluation, Mitigation and Explainability Generation
+    print("\nRunning Evaluation & Mitigation Pipeline...")
+    detector.eval()
+    
+    y_true_hall = []
+    y_pred_hall = []
+    pointing_ious = []
+    
+    # Process and evaluate each sample
+    for idx, sample in enumerate(processed_samples):
+        graph = evidence_graphs[idx].to(gnn_device)
+        with torch.no_grad():
+            preds = detector(graph.x_dict, graph.edge_index_dict)
+            
+        # Move predictions to CPU for post-processing
+        preds_cpu = {k: v.cpu() for k, v in preds.items()}
+        
+        # A. Mitigation: trigger attention reallocation
+        mitigation_res = causal_reallocate_attention(
+            vlm_wrapper, detector, sample["image"], sample["prompt"], 
+            sample["claims"], preds_cpu, 
+            alpha=i_config["alpha"], beta=i_config["beta"], 
+            threshold=i_config["hallucination_threshold"]
+        )
+        
+        # B. Explainability: generate subgraphs and JSON reports
+        os.makedirs("results/explanations", exist_ok=True)
+        for c_idx, claim in enumerate(sample["claims"]):
+            subgraph = extract_minimal_subgraph(graph, c_idx)
+            report = generate_explainability_report(claim, preds_cpu, c_idx, subgraph, sample["scores"][c_idx])
+            
+            # Save explainability JSON
+            with open(f"results/explanations/sample_{idx}_claim_{c_idx}.json", "w") as f:
+                json.dump(report, f, indent=2)
+                
+            # Log metrics
+            y_true_hall.append(1 if sample["scores"][c_idx]["visual_support"] < 0.25 else 0)
+            y_pred_hall.append(torch.sigmoid(preds_cpu["hallucination"])[c_idx].item())
+            
+        # C. Pointing IoU against region mask
+        raw_item = sample["raw_item"]
+        if raw_item["mask_rle"]:
+            gt_mask = rle_to_mask(raw_item["mask_rle"], raw_item["mask_h"], raw_item["mask_w"])
+            # Predict top supportive patch indices from first claim
+            first_claim_subgraph = extract_minimal_subgraph(graph, 0)
+            pred_patches = [p["patch_id"] for p in first_claim_subgraph["connected_patches"]]
+            
+            iou = compute_pointing_iou(pred_patches, gt_mask)
+            pointing_ious.append(iou)
+            
+    # Compute and display aggregated metrics
+    metrics = compute_detection_metrics(y_true_hall, y_pred_hall)
+    mean_iou = np.mean(pointing_ious) if pointing_ious else 0.0
+    
+    print("\n================== Aggregated Pipeline Results ==================")
+    print(f"Hallucination Detection F1-Score : {metrics['f1_score']:.4f}")
+    print(f"Hallucination Detection AUROC    : {metrics['auroc']:.4f}")
+    print(f"Localization Pointing IoU        : {mean_iou:.4f}")
+    print("==================================================================")
+    print("Explainability reports saved to: results/explanations/")
+    print("Pipeline Execution Completed Successfully.")
+
+if __name__ == "__main__":
+    run()

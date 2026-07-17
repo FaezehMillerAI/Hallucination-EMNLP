@@ -1,0 +1,14 @@
+# Python caches
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+
+# Local GNN datasets / results
+data/
+results/
+.ipynb_checkpoints/
+
+# System files
+.DS_Store

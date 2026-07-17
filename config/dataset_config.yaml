@@ -1,0 +1,9 @@
+dataset:
+  name: "MM-Hallu/HEAL-MedVQA"
+  train_config: "train"
+  test_config: "test"
+  splits:
+    train: "train"
+    test: "test"
+  image_size: [1024, 1024]
+  num_classes: 4  # Number of hallucination causes
