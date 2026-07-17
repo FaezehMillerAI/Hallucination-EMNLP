@@ -118,9 +118,9 @@ class VLMWrapper:
                     vision_embeddings = vision_outputs
                 except Exception:
                     pass
-            if vision_embeddings is None:
-                # Fallback: create random or extract from hidden states
-                vision_embeddings = torch.randn(1, 196, 1536, device=self.device)
+        if vision_embeddings is None:
+            # Fallback: create random or extract from hidden states
+            vision_embeddings = torch.randn(1, 196, 1536, device=self.device)
                 
         # Obtain input tokens decoded
         input_ids = inputs["input_ids"][0]
