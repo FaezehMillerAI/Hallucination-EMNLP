@@ -1,6 +1,6 @@
 import torch
 import torch.nn as nn
-from transformers import AutoProcessor, AutoModelForVision2Seq
+from transformers import AutoProcessor, AutoModelForCausalLM
 
 class VLMWrapper:
     """
@@ -16,7 +16,7 @@ class VLMWrapper:
         if not self.dummy_mode:
             print(f"Loading VLM model: {self.model_name} on {self.device}...")
             self.processor = AutoProcessor.from_pretrained(self.model_name)
-            self.model = AutoModelForVision2Seq.from_pretrained(
+            self.model = AutoModelForCausalLM.from_pretrained(
                 self.model_name,
                 torch_dtype=torch.float16 if "cuda" in self.device else torch.float32,
                 low_cpu_mem_usage=True

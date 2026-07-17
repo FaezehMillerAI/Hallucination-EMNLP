@@ -6,6 +6,7 @@ import torch
 import torch.nn as nn
 from PIL import Image
 from datasets import load_dataset
+from tqdm import tqdm
 
 # Import modules from src
 from src.claim_parser.claim_decomposer import decompose_claims
@@ -103,7 +104,7 @@ def run():
     
     # Run on a subset (e.g. 5 samples for quick training demonstration)
     subset_limit = 5
-    for idx in range(min(subset_limit, len(train_split))):
+    for idx in tqdm(range(min(subset_limit, len(train_split))), desc="Extracting Graphs"):
         item = train_split[idx]
         image = item["image"]
         question = item["question"]
@@ -170,7 +171,8 @@ def run():
     lambda_faith = t_config["loss_weights"]["lambda_faith"]
     lambda_local = t_config["loss_weights"]["lambda_local"]
     
-    for epoch in range(t_config["epochs"]):
+    pbar = tqdm(range(t_config["epochs"]), desc="GNN Training")
+    for epoch in pbar:
         epoch_loss = 0.0
         for graph_idx, graph in enumerate(evidence_graphs):
             # Move graph parameters to GPU 1 / cuda:1 for GNN HGT forward/backward passes
@@ -211,7 +213,7 @@ def run():
             optimizer.step()
             epoch_loss += total_loss.item()
             
-        print(f"  Epoch {epoch+1:02d}/{t_config['epochs']} | Loss: {epoch_loss/len(evidence_graphs):.4f}")
+        pbar.set_postfix(loss=f"{epoch_loss/len(evidence_graphs):.4f}")
         
     # 8. Evaluation, Mitigation and Explainability Generation
     print("\nRunning Evaluation & Mitigation Pipeline...")
@@ -222,7 +224,7 @@ def run():
     pointing_ious = []
     
     # Process and evaluate each sample
-    for idx, sample in enumerate(processed_samples):
+    for idx, sample in enumerate(tqdm(processed_samples, desc="Evaluating & Mitigating")):
         graph = evidence_graphs[idx].to(gnn_device)
         with torch.no_grad():
             preds = detector(graph.x_dict, graph.edge_index_dict)
