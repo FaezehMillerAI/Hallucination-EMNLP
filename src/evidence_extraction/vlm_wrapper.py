@@ -132,16 +132,12 @@ class VLMWrapper:
             attentions = outputs.decoder_attentions
             
         # Sanitise all outputs against NaN/Inf overflows (common in float16 on T4 GPUs)
-        logits = outputs.logits.detach().cpu()
-        if torch.isnan(logits).any() or torch.isinf(logits).any():
-            logits = torch.nan_to_num(logits, nan=0.0, posinf=1e4, neginf=-1e4)
+        logits = torch.nan_to_num(outputs.logits.detach().cpu(), nan=0.0, posinf=20.0, neginf=-20.0)
             
         hidden_states = []
         for h in outputs.hidden_states:
             if h is not None:
-                h_cpu = h.detach().cpu()
-                if torch.isnan(h_cpu).any() or torch.isinf(h_cpu).any():
-                    h_cpu = torch.nan_to_num(h_cpu, nan=0.0, posinf=1e4, neginf=-1e4)
+                h_cpu = torch.nan_to_num(h.detach().cpu(), nan=0.0, posinf=10.0, neginf=-10.0)
                 hidden_states.append(h_cpu)
                 
         cleaned_attentions = None
@@ -149,15 +145,12 @@ class VLMWrapper:
             cleaned_attentions = []
             for a in attentions:
                 if a is not None:
-                    a_cpu = a.detach().cpu()
-                    if torch.isnan(a_cpu).any() or torch.isinf(a_cpu).any():
-                        a_cpu = torch.nan_to_num(a_cpu, nan=0.0, posinf=1.0, neginf=0.0)
+                    a_cpu = torch.nan_to_num(a.detach().cpu(), nan=0.0, posinf=1.0, neginf=0.0)
                     cleaned_attentions.append(a_cpu)
             cleaned_attentions = tuple(cleaned_attentions)
             
         v_embed = vision_embeddings.detach().cpu() if hasattr(vision_embeddings, "detach") else vision_embeddings
-        if torch.isnan(v_embed).any() or torch.isinf(v_embed).any():
-            v_embed = torch.nan_to_num(v_embed, nan=0.0, posinf=1e4, neginf=-1e4)
+        v_embed = torch.nan_to_num(v_embed, nan=0.0, posinf=10.0, neginf=-10.0)
             
         return {
             "logits": logits,
