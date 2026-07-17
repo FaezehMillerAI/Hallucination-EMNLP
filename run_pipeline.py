@@ -221,6 +221,11 @@ def run():
             target_faith = torch.tensor([s["counterfactual_consistency"] for s in scores_list], dtype=torch.float32, device=gnn_device).unsqueeze(-1)
             target_local = torch.tensor([s["trajectory_stability"] for s in scores_list], dtype=torch.float32, device=gnn_device).unsqueeze(-1)
             
+            # Bounding and sanitizing target values to prevent gradient explosion and NaN loss
+            target_suff = torch.nan_to_num(torch.clamp(target_suff, 0.0, 1.0), nan=0.0)
+            target_faith = torch.nan_to_num(torch.clamp(target_faith, 0.0, 1.0), nan=0.0)
+            target_local = torch.nan_to_num(torch.clamp(target_local, 0.0, 1.0), nan=0.0)
+            
             # Loss computations
             loss_hall = nn.BCEWithLogitsLoss()(preds["hallucination"], target_hall)
             loss_cause = nn.CrossEntropyLoss()(preds["cause"], target_cause)
@@ -238,6 +243,8 @@ def run():
             )
             
             total_loss.backward()
+            # Gradient clipping to stabilize weights updates
+            nn.utils.clip_grad_norm_(detector.parameters(), max_norm=1.0)
             optimizer.step()
             epoch_loss += total_loss.item()
             
