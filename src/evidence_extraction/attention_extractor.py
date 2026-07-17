@@ -52,7 +52,7 @@ class AttentionExtractor:
         Returns:
             Tensor of shape (num_layers, seq_len, num_patches) representing text-to-patch attention
         """
-        if attentions is None:
+        if not attentions:
             # Fallback if VLM has no attention output (e.g. mock mode without attentions)
             return torch.zeros(self.num_layers, 20, num_patches) # Mock sequence length 20
             
