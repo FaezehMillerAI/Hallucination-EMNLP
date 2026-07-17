@@ -141,7 +141,7 @@ def run():
             
             # C. Extract attention dynamics and cross-attentions
             token_dynamics = attn_extractor.extract_dynamics(vlm_outputs["logits"])
-            cross_atts = attn_extractor.extract_cross_attention(vlm_outputs["attentions"], num_patches=196)
+            cross_atts = attn_extractor.extract_cross_attention(vlm_outputs["attentions"], num_patches=196, seq_len=len(vlm_outputs["tokens"]))
             
             # D. Build PyG HeteroData evidence graph
             graph = graph_builder.build_graph(vlm_outputs, claims, token_dynamics, cross_atts)

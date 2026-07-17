@@ -42,19 +42,20 @@ class AttentionExtractor:
             "predictions": predictions.tolist()
         }
 
-    def extract_cross_attention(self, attentions: tuple, num_patches: int) -> torch.Tensor:
+    def extract_cross_attention(self, attentions: tuple, num_patches: int, seq_len: int = 20) -> torch.Tensor:
         """
         Extracts cross-attention trajectories (attention from text tokens to visual patches).
         
         Args:
             attentions (tuple): Tuple of L layers, each shape (1, num_heads, seq_len, seq_len)
             num_patches (int): Number of visual patches (e.g. 196)
+            seq_len (int): Default sequence length for fallback tensor
         Returns:
             Tensor of shape (num_layers, seq_len, num_patches) representing text-to-patch attention
         """
         if not attentions:
             # Fallback if VLM has no attention output (e.g. mock mode without attentions)
-            return torch.zeros(self.num_layers, 20, num_patches) # Mock sequence length 20
+            return torch.zeros(self.num_layers, seq_len, num_patches)
             
         num_layers = len(attentions)
         seq_len = attentions[0].shape[-1]
