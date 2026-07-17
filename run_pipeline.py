@@ -86,66 +86,94 @@ def run():
     perturb_engine = PerturbationEngine(patch_size=m_config["patch_size"])
     graph_builder = EvidenceGraphBuilder(hidden_dim=m_config["hidden_size"], num_layers=m_config["num_layers"])
     
-    # 4. Load HEAL-MedVQA Dataset
-    print(f"\nLoading dataset {d_config['name']}...")
-    try:
-        dataset_dict = load_dataset(d_config["name"], d_config["train_config"])
-        train_split = dataset_dict[d_config["splits"]["train"]]
-    except Exception as e:
-        print(f"Failed to load dataset: {e}. Running with mock datasets.")
-        train_split = [{"image": Image.new("L", (100, 100), 128), "question": "Is there infiltration?", "answer": "The location of Right lower lung is at <seg>. The answer is No", "anatomy": "Right lower lung", "mask_rle": [10, 20], "mask_h": 100, "mask_w": 100, "question_type": 0}]
-        
-    print(f"Loaded dataset successfully. Split size: {len(train_split)} rows.")
+    # 4. Check Cache for Constructed Graphs
+    cache_dir = "data/processed"
+    graphs_cache_path = os.path.join(cache_dir, "graphs.pt")
+    samples_cache_path = os.path.join(cache_dir, "samples.pt")
     
-    # 5. Extract Evidence and Build Graph Dataset
-    print("\nExtracting cross-modal evidence graphs...")
+    use_cache = os.path.exists(graphs_cache_path) and os.path.exists(samples_cache_path)
+    
     evidence_graphs = []
     processed_samples = []
     
-    # Run on a subset (e.g. 5 samples for quick training demonstration)
-    subset_limit = 5
-    for idx in tqdm(range(min(subset_limit, len(train_split))), desc="Extracting Graphs"):
-        item = train_split[idx]
-        image = item["image"]
-        question = item["question"]
-        answer = item["answer"]
-        
-        prompt = f"Question: {question} Answer: {answer}"
-        
-        # A. Split and decompose atomic claims
-        claims = decompose_claims(answer)
-        if not claims:
-            continue
+    if use_cache:
+        print(f"\nFound cached graphs and processed samples in '{cache_dir}'. Loading...")
+        try:
+            evidence_graphs = torch.load(graphs_cache_path, weights_only=False)
+            processed_samples = torch.load(samples_cache_path, weights_only=False)
+            print(f"Successfully loaded {len(evidence_graphs)} graphs from cache. Skipping VLM extraction!")
+        except Exception as e:
+            print(f"Failed to load cache: {e}. Re-running extraction...")
+            use_cache = False
             
-        # B. Run VLM Forward pass to retrieve attentions and states
-        vlm_outputs = vlm_wrapper.process_and_forward(image, prompt)
-        
-        # C. Extract attention dynamics and cross-attentions
-        token_dynamics = attn_extractor.extract_dynamics(vlm_outputs["logits"])
-        cross_atts = attn_extractor.extract_cross_attention(vlm_outputs["attentions"], num_patches=196)
-        
-        # D. Build PyG HeteroData evidence graph
-        graph = graph_builder.build_graph(vlm_outputs, claims, token_dynamics, cross_atts)
-        
-        # Compute custom faithfulness scores (for pseudo-labeling)
-        scores = compute_custom_scores(claims, vlm_outputs, cross_atts)
-        
-        # Compute counterfactual faithfulness via image perturbation
-        for c_idx, claim in enumerate(claims):
-            supportive_patches = [item[1] for item in graph["claim", "grounded_in", "visualpatch"].edge_index.t().tolist() if item[0] == c_idx]
-            faith_cf = perturb_engine.compute_faithfulness_score(vlm_wrapper, image, prompt, claim["token_span"], supportive_patches)
-            scores[c_idx]["counterfactual_consistency"] = faith_cf
+    if not use_cache:
+        # Load HEAL-MedVQA Dataset
+        print(f"\nLoading dataset {d_config['name']}...")
+        try:
+            dataset_dict = load_dataset(d_config["name"], d_config["train_config"])
+            train_split = dataset_dict[d_config["splits"]["train"]]
+        except Exception as e:
+            print(f"Failed to load dataset: {e}. Running with mock datasets.")
+            train_split = [{"image": Image.new("L", (100, 100), 128), "question": "Is there infiltration?", "answer": "The location of Right lower lung is at <seg>. The answer is No", "anatomy": "Right lower lung", "mask_rle": [10, 20], "mask_h": 100, "mask_w": 100, "question_type": 0}]
             
-        evidence_graphs.append(graph)
-        processed_samples.append({
-            "image": image,
-            "prompt": prompt,
-            "claims": claims,
-            "scores": scores,
-            "raw_item": item
-        })
-        print(f"  - Sample {idx+1}/{subset_limit} graph constructed: {len(claims)} atomic claims.")
+        print(f"Loaded dataset successfully. Split size: {len(train_split)} rows.")
         
+        # 5. Extract Evidence and Build Graph Dataset
+        print("\nExtracting cross-modal evidence graphs...")
+        
+        # Run on a subset (e.g. 5 samples for quick training demonstration)
+        subset_limit = 5
+        for idx in tqdm(range(min(subset_limit, len(train_split))), desc="Extracting Graphs"):
+            item = train_split[idx]
+            image = item["image"]
+            question = item["question"]
+            answer = item["answer"]
+            
+            prompt = f"Question: {question} Answer: {answer}"
+            
+            # A. Split and decompose atomic claims
+            claims = decompose_claims(answer)
+            if not claims:
+                continue
+                
+            # B. Run VLM Forward pass to retrieve attentions and states
+            vlm_outputs = vlm_wrapper.process_and_forward(image, prompt)
+            
+            # C. Extract attention dynamics and cross-attentions
+            token_dynamics = attn_extractor.extract_dynamics(vlm_outputs["logits"])
+            cross_atts = attn_extractor.extract_cross_attention(vlm_outputs["attentions"], num_patches=196)
+            
+            # D. Build PyG HeteroData evidence graph
+            graph = graph_builder.build_graph(vlm_outputs, claims, token_dynamics, cross_atts)
+            
+            # Compute custom faithfulness scores (for pseudo-labeling)
+            scores = compute_custom_scores(claims, vlm_outputs, cross_atts)
+            
+            # Compute counterfactual faithfulness via image perturbation
+            for c_idx, claim in enumerate(claims):
+                supportive_patches = [item[1] for item in graph["claim", "grounded_in", "visualpatch"].edge_index.t().tolist() if item[0] == c_idx]
+                faith_cf = perturb_engine.compute_faithfulness_score(vlm_wrapper, image, prompt, claim["token_span"], supportive_patches)
+                scores[c_idx]["counterfactual_consistency"] = faith_cf
+                
+            evidence_graphs.append(graph)
+            processed_samples.append({
+                "image": image,
+                "prompt": prompt,
+                "claims": claims,
+                "scores": scores,
+                "raw_item": item
+            })
+            print(f"  - Sample {idx+1}/{subset_limit} graph constructed: {len(claims)} atomic claims.")
+            
+        # Save constructed objects to disk
+        os.makedirs(cache_dir, exist_ok=True)
+        try:
+            torch.save(evidence_graphs, graphs_cache_path)
+            torch.save(processed_samples, samples_cache_path)
+            print(f"Successfully cached {len(evidence_graphs)} graphs and samples to '{cache_dir}' for future runs.")
+        except Exception as e:
+            print(f"Failed to write cache to disk: {e}")
+            
     if not evidence_graphs:
         print("No evidence graphs were successfully constructed. Exiting.")
         return
