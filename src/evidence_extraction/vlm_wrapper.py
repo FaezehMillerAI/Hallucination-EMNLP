@@ -1,6 +1,6 @@
 import torch
 import torch.nn as nn
-from transformers import AutoProcessor, AutoModelForCausalLM
+from transformers import AutoProcessor
 
 class VLMWrapper:
     """
@@ -16,11 +16,41 @@ class VLMWrapper:
         if not self.dummy_mode:
             print(f"Loading VLM model: {self.model_name} on {self.device}...")
             self.processor = AutoProcessor.from_pretrained(self.model_name)
-            self.model = AutoModelForCausalLM.from_pretrained(
-                self.model_name,
-                torch_dtype=torch.float16 if "cuda" in self.device else torch.float32,
-                low_cpu_mem_usage=True
-            ).to(self.device)
+            
+            # Try specific loaders for VLM to be robust on Kaggle
+            model_loaded = False
+            if "qwen2-vl" in self.model_name.lower():
+                try:
+                    from transformers import Qwen2VLForConditionalGeneration
+                    self.model = Qwen2VLForConditionalGeneration.from_pretrained(
+                        self.model_name,
+                        torch_dtype=torch.float16 if "cuda" in self.device else torch.float32,
+                        low_cpu_mem_usage=True
+                    ).to(self.device)
+                    model_loaded = True
+                    print("Successfully loaded using Qwen2VLForConditionalGeneration")
+                except Exception as e:
+                    print(f"Failed to load using Qwen2VLForConditionalGeneration: {e}")
+            
+            if not model_loaded:
+                for auto_class_name in ["AutoModelForVision2Seq", "AutoModelForConditionalGeneration", "AutoModel"]:
+                    try:
+                        import transformers
+                        auto_class = getattr(transformers, auto_class_name, None)
+                        if auto_class is not None:
+                            self.model = auto_class.from_pretrained(
+                                self.model_name,
+                                torch_dtype=torch.float16 if "cuda" in self.device else torch.float32,
+                                low_cpu_mem_usage=True
+                            ).to(self.device)
+                            print(f"Successfully loaded using {auto_class_name}")
+                            model_loaded = True
+                            break
+                    except Exception as e:
+                        print(f"Could not load using {auto_class_name}: {e}")
+                        
+            if not model_loaded:
+                raise ImportError(f"Could not load VLM model {self.model_name} using any AutoModel classes.")
             self.model.eval()
         else:
             print(f"Initializing VLM Wrapper in DUMMY mode for {self.model_name}...")
