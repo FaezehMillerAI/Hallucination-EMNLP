@@ -55,7 +55,24 @@ def causal_reallocate_attention(vlm_wrapper, hgt_detector, image, prompt: str,
         
         # Regenerate from VLM
         try:
-            inputs = vlm_wrapper.processor(text=prefix_prompt, images=image, return_tensors="pt").to(vlm_wrapper.device)
+            if "qwen2" in vlm_wrapper.model_name.lower():
+                messages = [
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "image", "image": image},
+                            {"type": "text", "text": prefix_prompt},
+                        ],
+                    }
+                ]
+                formatted_prefix = vlm_wrapper.processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+                inputs = vlm_wrapper.processor(text=[formatted_prefix], images=[image], return_tensors="pt").to(vlm_wrapper.device)
+            elif "llava" in vlm_wrapper.model_name.lower():
+                formatted_prefix = prefix_prompt if "<image>" in prefix_prompt else f"<image>\n{prefix_prompt}"
+                inputs = vlm_wrapper.processor(text=formatted_prefix, images=image, return_tensors="pt").to(vlm_wrapper.device)
+            else:
+                inputs = vlm_wrapper.processor(text=prefix_prompt, images=image, return_tensors="pt").to(vlm_wrapper.device)
+                
             with torch.no_grad():
                 gen_outputs = vlm_wrapper.model.generate(**inputs, max_new_tokens=30)
             corrected_text = vlm_wrapper.processor.tokenizer.decode(gen_outputs[0], skip_special_tokens=True)
