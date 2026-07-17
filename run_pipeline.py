@@ -39,6 +39,66 @@ def load_yaml(path):
     with open(path, 'r') as f:
         return yaml.safe_load(f)
 
+def extract_split_graphs(vlm_wrapper, attn_extractor, perturb_engine, graph_builder, 
+                         dataset_name, config_name, split_key, limit=5):
+    print(f"\nLoading dataset {dataset_name} ({config_name} config)...")
+    try:
+        dataset_dict = load_dataset(dataset_name, config_name)
+        split_data = dataset_dict[split_key]
+    except Exception as e:
+        print(f"Failed to load dataset split {config_name}: {e}. Running with mock datasets.")
+        split_data = [{"image": Image.new("L", (100, 100), 128), "question": "Is there infiltration?", "answer": "The location of Right lower lung is at <seg>. The answer is No", "anatomy": "Right lower lung", "mask_rle": [10, 20], "mask_h": 100, "mask_w": 100, "question_type": 0}]
+        
+    print(f"Loaded dataset split successfully. Split size: {len(split_data)} rows.")
+    
+    print(f"\nExtracting cross-modal evidence graphs for {config_name} split...")
+    evidence_graphs = []
+    processed_samples = []
+    
+    for idx in tqdm(range(min(limit, len(split_data))), desc=f"Extracting {config_name} Graphs"):
+        item = split_data[idx]
+        image = item["image"]
+        question = item["question"]
+        answer = item["answer"]
+        
+        prompt = f"Question: {question} Answer: {answer}"
+        
+        # A. Split and decompose atomic claims
+        claims = decompose_claims(answer)
+        if not claims:
+            continue
+            
+        # B. Run VLM Forward pass to retrieve attentions and states
+        vlm_outputs = vlm_wrapper.process_and_forward(image, prompt)
+        
+        # C. Extract attention dynamics and cross-attentions
+        token_dynamics = attn_extractor.extract_dynamics(vlm_outputs["logits"])
+        cross_atts = attn_extractor.extract_cross_attention(vlm_outputs["attentions"], num_patches=196, seq_len=len(vlm_outputs["tokens"]))
+        
+        # D. Build PyG HeteroData evidence graph
+        graph = graph_builder.build_graph(vlm_outputs, claims, token_dynamics, cross_atts)
+        
+        # Compute custom faithfulness scores (for pseudo-labeling)
+        scores = compute_custom_scores(claims, vlm_outputs, cross_atts)
+        
+        # Compute counterfactual faithfulness via image perturbation
+        for c_idx, claim in enumerate(claims):
+            supportive_patches = [item[1] for item in graph["claim", "grounded_in", "visualpatch"].edge_index.t().tolist() if item[0] == c_idx]
+            faith_cf = perturb_engine.compute_faithfulness_score(vlm_wrapper, image, prompt, claim["token_span"], supportive_patches)
+            scores[c_idx]["counterfactual_consistency"] = faith_cf
+            
+        evidence_graphs.append(graph)
+        processed_samples.append({
+            "image": image,
+            "prompt": prompt,
+            "claims": claims,
+            "scores": scores,
+            "raw_item": item
+        })
+        print(f"  - Sample {idx+1}/{min(limit, len(split_data))} graph constructed.")
+        
+    return evidence_graphs, processed_samples
+
 def run():
     print("====================================================================")
     print("Starting KG-LESS: Causal Hallucination Detection & Mitigation Pipeline")
@@ -88,98 +148,61 @@ def run():
     
     # 4. Check Cache for Constructed Graphs
     cache_dir = "data/processed"
-    graphs_cache_path = os.path.join(cache_dir, "graphs.pt")
-    samples_cache_path = os.path.join(cache_dir, "samples.pt")
+    train_graphs_path = os.path.join(cache_dir, "train_graphs.pt")
+    train_samples_path = os.path.join(cache_dir, "train_samples.pt")
+    test_graphs_path = os.path.join(cache_dir, "test_graphs.pt")
+    test_samples_path = os.path.join(cache_dir, "test_samples.pt")
     
-    use_cache = os.path.exists(graphs_cache_path) and os.path.exists(samples_cache_path)
+    use_cache = (
+        os.path.exists(train_graphs_path) and os.path.exists(train_samples_path) and
+        os.path.exists(test_graphs_path) and os.path.exists(test_samples_path)
+    )
     
-    evidence_graphs = []
-    processed_samples = []
+    train_graphs, train_samples = [], []
+    test_graphs, test_samples = [], []
     
     if use_cache:
-        print(f"\nFound cached graphs and processed samples in '{cache_dir}'. Loading...")
+        print(f"\nFound cached train/test graphs and samples in '{cache_dir}'. Loading...")
         try:
-            evidence_graphs = torch.load(graphs_cache_path, weights_only=False)
-            processed_samples = torch.load(samples_cache_path, weights_only=False)
-            print(f"Successfully loaded {len(evidence_graphs)} graphs from cache. Skipping VLM extraction!")
+            train_graphs = torch.load(train_graphs_path, weights_only=False)
+            train_samples = torch.load(train_samples_path, weights_only=False)
+            test_graphs = torch.load(test_graphs_path, weights_only=False)
+            test_samples = torch.load(test_samples_path, weights_only=False)
+            print(f"Successfully loaded train ({len(train_graphs)}) and test ({len(test_graphs)}) graphs from cache. Skipping VLM extraction!")
         except Exception as e:
             print(f"Failed to load cache: {e}. Re-running extraction...")
             use_cache = False
             
     if not use_cache:
-        # Load HEAL-MedVQA Dataset
-        print(f"\nLoading dataset {d_config['name']}...")
-        try:
-            dataset_dict = load_dataset(d_config["name"], d_config["train_config"])
-            train_split = dataset_dict[d_config["splits"]["train"]]
-        except Exception as e:
-            print(f"Failed to load dataset: {e}. Running with mock datasets.")
-            train_split = [{"image": Image.new("L", (100, 100), 128), "question": "Is there infiltration?", "answer": "The location of Right lower lung is at <seg>. The answer is No", "anatomy": "Right lower lung", "mask_rle": [10, 20], "mask_h": 100, "mask_w": 100, "question_type": 0}]
-            
-        print(f"Loaded dataset successfully. Split size: {len(train_split)} rows.")
+        # Extract Train split (limit to 5 samples for quick training demonstration)
+        train_graphs, train_samples = extract_split_graphs(
+            vlm_wrapper, attn_extractor, perturb_engine, graph_builder,
+            d_config["name"], d_config["train_config"], d_config["splits"]["train"], limit=5
+        )
         
-        # 5. Extract Evidence and Build Graph Dataset
-        print("\nExtracting cross-modal evidence graphs...")
+        # Extract Test split (limit to 5 samples for quick training demonstration)
+        test_graphs, test_samples = extract_split_graphs(
+            vlm_wrapper, attn_extractor, perturb_engine, graph_builder,
+            d_config["name"], d_config["test_config"], d_config["splits"]["test"], limit=5
+        )
         
-        # Run on a subset (e.g. 5 samples for quick training demonstration)
-        subset_limit = 5
-        for idx in tqdm(range(min(subset_limit, len(train_split))), desc="Extracting Graphs"):
-            item = train_split[idx]
-            image = item["image"]
-            question = item["question"]
-            answer = item["answer"]
-            
-            prompt = f"Question: {question} Answer: {answer}"
-            
-            # A. Split and decompose atomic claims
-            claims = decompose_claims(answer)
-            if not claims:
-                continue
-                
-            # B. Run VLM Forward pass to retrieve attentions and states
-            vlm_outputs = vlm_wrapper.process_and_forward(image, prompt)
-            
-            # C. Extract attention dynamics and cross-attentions
-            token_dynamics = attn_extractor.extract_dynamics(vlm_outputs["logits"])
-            cross_atts = attn_extractor.extract_cross_attention(vlm_outputs["attentions"], num_patches=196, seq_len=len(vlm_outputs["tokens"]))
-            
-            # D. Build PyG HeteroData evidence graph
-            graph = graph_builder.build_graph(vlm_outputs, claims, token_dynamics, cross_atts)
-            
-            # Compute custom faithfulness scores (for pseudo-labeling)
-            scores = compute_custom_scores(claims, vlm_outputs, cross_atts)
-            
-            # Compute counterfactual faithfulness via image perturbation
-            for c_idx, claim in enumerate(claims):
-                supportive_patches = [item[1] for item in graph["claim", "grounded_in", "visualpatch"].edge_index.t().tolist() if item[0] == c_idx]
-                faith_cf = perturb_engine.compute_faithfulness_score(vlm_wrapper, image, prompt, claim["token_span"], supportive_patches)
-                scores[c_idx]["counterfactual_consistency"] = faith_cf
-                
-            evidence_graphs.append(graph)
-            processed_samples.append({
-                "image": image,
-                "prompt": prompt,
-                "claims": claims,
-                "scores": scores,
-                "raw_item": item
-            })
-            print(f"  - Sample {idx+1}/{subset_limit} graph constructed: {len(claims)} atomic claims.")
-            
         # Save constructed objects to disk
         os.makedirs(cache_dir, exist_ok=True)
         try:
-            torch.save(evidence_graphs, graphs_cache_path)
-            torch.save(processed_samples, samples_cache_path)
-            print(f"Successfully cached {len(evidence_graphs)} graphs and samples to '{cache_dir}' for future runs.")
+            torch.save(train_graphs, train_graphs_path)
+            torch.save(train_samples, train_samples_path)
+            torch.save(test_graphs, test_graphs_path)
+            torch.save(test_samples, test_samples_path)
+            print(f"Successfully cached train and test graphs/samples to '{cache_dir}' for future runs.")
         except Exception as e:
             print(f"Failed to write cache to disk: {e}")
             
-    if not evidence_graphs:
-        print("No evidence graphs were successfully constructed. Exiting.")
+    if not train_graphs or not test_graphs:
+        print("Failed to construct evidence graphs for train or test split. Exiting.")
         return
         
     # 6. Initialize GNN HGT Detector on GNN designated device (GPU 1 / cuda:1)
-    metadata = evidence_graphs[0].metadata()
+    metadata = train_graphs[0].metadata()
     detector = GNNHallucinationDetector(
         metadata=metadata,
         hidden_channels=128,
@@ -202,7 +225,7 @@ def run():
     pbar = tqdm(range(t_config["epochs"]), desc="GNN Training")
     for epoch in pbar:
         epoch_loss = 0.0
-        for graph_idx, graph in enumerate(evidence_graphs):
+        for graph_idx, graph in enumerate(train_graphs):
             # Move graph parameters to GPU 1 / cuda:1 for GNN HGT forward/backward passes
             graph = graph.to(gnn_device)
             optimizer.zero_grad()
@@ -212,7 +235,7 @@ def run():
             
             # Pseudo-labeling target variables
             num_claims = graph["claim"].x.shape[0]
-            scores_list = processed_samples[graph_idx]["scores"]
+            scores_list = train_samples[graph_idx]["scores"]
             
             # Parse targets
             target_hall = torch.tensor([1.0 if s["visual_support"] < 0.25 else 0.0 for s in scores_list], dtype=torch.float32, device=gnn_device).unsqueeze(-1)
@@ -248,7 +271,7 @@ def run():
             optimizer.step()
             epoch_loss += total_loss.item()
             
-        pbar.set_postfix(loss=f"{epoch_loss/len(evidence_graphs):.4f}")
+        pbar.set_postfix(loss=f"{epoch_loss/len(train_graphs):.4f}")
         
     # 8. Evaluation, Mitigation and Explainability Generation
     print("\nRunning Evaluation & Mitigation Pipeline...")
@@ -268,8 +291,8 @@ def run():
     correct_passes = 0
     
     # Process and evaluate each sample
-    for idx, sample in enumerate(tqdm(processed_samples, desc="Evaluating & Mitigating")):
-        graph = evidence_graphs[idx].to(gnn_device)
+    for idx, sample in enumerate(tqdm(test_samples, desc="Evaluating & Mitigating")):
+        graph = test_graphs[idx].to(gnn_device)
         with torch.no_grad():
             preds = detector(graph.x_dict, graph.edge_index_dict)
             
