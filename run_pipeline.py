@@ -40,7 +40,7 @@ def load_yaml(path):
         return yaml.safe_load(f)
 
 def extract_split_graphs(vlm_wrapper, attn_extractor, perturb_engine, graph_builder, 
-                         dataset_name, config_name, split_key, limit=5):
+                         dataset_name, config_name, split_key, limit=None):
     print(f"\nLoading dataset {dataset_name} ({config_name} config)...")
     try:
         dataset_dict = load_dataset(dataset_name, config_name)
@@ -55,7 +55,8 @@ def extract_split_graphs(vlm_wrapper, attn_extractor, perturb_engine, graph_buil
     evidence_graphs = []
     processed_samples = []
     
-    for idx in tqdm(range(min(limit, len(split_data))), desc=f"Extracting {config_name} Graphs"):
+    actual_limit = limit if limit is not None else len(split_data)
+    for idx in tqdm(range(min(actual_limit, len(split_data))), desc=f"Extracting {config_name} Graphs"):
         item = split_data[idx]
         image = item["image"]
         question = item["question"]
@@ -95,11 +96,20 @@ def extract_split_graphs(vlm_wrapper, attn_extractor, perturb_engine, graph_buil
             "scores": scores,
             "raw_item": item
         })
-        print(f"  - Sample {idx+1}/{min(limit, len(split_data))} graph constructed.")
+        print(f"  - Sample {idx+1}/{min(actual_limit, len(split_data))} graph constructed.")
         
     return evidence_graphs, processed_samples
 
 def run():
+    import argparse
+    parser = argparse.ArgumentParser(description="Run KG-LESS Hallucination Pipeline")
+    parser.add_argument("--train_limit", type=int, default=None, help="Number of training samples to extract (default: None for full dataset)")
+    parser.add_argument("--test_limit", type=int, default=None, help="Number of testing samples to extract (default: None for full dataset)")
+    args, unknown = parser.parse_known_args()
+    
+    train_limit = args.train_limit
+    test_limit = args.test_limit
+    
     print("====================================================================")
     print("Starting KG-LESS: Causal Hallucination Detection & Mitigation Pipeline")
     print("====================================================================")
@@ -174,16 +184,16 @@ def run():
             use_cache = False
             
     if not use_cache:
-        # Extract Train split (limit to 5 samples for quick training demonstration)
+        # Extract Train split
         train_graphs, train_samples = extract_split_graphs(
             vlm_wrapper, attn_extractor, perturb_engine, graph_builder,
-            d_config["name"], d_config["train_config"], d_config["splits"]["train"], limit=5
+            d_config["name"], d_config["train_config"], d_config["splits"]["train"], limit=train_limit
         )
         
-        # Extract Test split (limit to 5 samples for quick training demonstration)
+        # Extract Test split
         test_graphs, test_samples = extract_split_graphs(
             vlm_wrapper, attn_extractor, perturb_engine, graph_builder,
-            d_config["name"], d_config["test_config"], d_config["splits"]["test"], limit=5
+            d_config["name"], d_config["test_config"], d_config["splits"]["test"], limit=test_limit
         )
         
         # Save constructed objects to disk
