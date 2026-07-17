@@ -73,7 +73,29 @@ class VLMWrapper:
             return self._simulate_forward(text_prompt)
             
         # Real Hugging Face VLM execution
-        inputs = self.processor(text=text_prompt, images=image, return_tensors="pt").to(self.device)
+        if "qwen2" in self.model_name.lower():
+            try:
+                # Format using Qwen2-VL chat template
+                messages = [
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "image", "image": image},
+                            {"type": "text", "text": text_prompt},
+                        ],
+                    }
+                ]
+                formatted_text = self.processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+                inputs = self.processor(text=[formatted_text], images=[image], return_tensors="pt").to(self.device)
+            except Exception as e:
+                print(f"Fallback formatting for Qwen2-VL: {e}")
+                # Manual fallback with standard image placeholder
+                inputs = self.processor(text=f"<|im_start|>user\n<|vision_start|><|image_pad|><|vision_end|>{text_prompt}<|im_end|>\n<|im_start|>assistant\n", images=image, return_tensors="pt").to(self.device)
+        elif "llava" in self.model_name.lower():
+            formatted_text = text_prompt if "<image>" in text_prompt else f"<image>\n{text_prompt}"
+            inputs = self.processor(text=formatted_text, images=image, return_tensors="pt").to(self.device)
+        else:
+            inputs = self.processor(text=text_prompt, images=image, return_tensors="pt").to(self.device)
         
         with torch.no_grad():
             outputs = self.model(
