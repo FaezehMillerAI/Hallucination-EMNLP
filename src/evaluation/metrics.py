@@ -1,9 +1,30 @@
 import numpy as np
 
+def compute_ece(y_true: np.ndarray, y_pred: np.ndarray, num_bins: int = 10) -> float:
+    """
+    Computes the Expected Calibration Error (ECE) for the detector probabilities.
+    Quantifies the discrepancy between predicted confidence and empirical accuracy.
+    """
+    ece = 0.0
+    for b in range(1, num_bins + 1):
+        bin_lower = (b - 1) / num_bins
+        bin_upper = b / num_bins
+        
+        # Elements in this bin
+        in_bin = (y_pred >= bin_lower) & (y_pred < bin_upper)
+        prop_in_bin = np.mean(in_bin)
+        
+        if prop_in_bin > 0:
+            accuracy_in_bin = np.mean(y_true[in_bin])
+            avg_confidence_in_bin = np.mean(y_pred[in_bin])
+            ece += prop_in_bin * np.abs(avg_confidence_in_bin - accuracy_in_bin)
+            
+    return float(ece)
+
 def compute_detection_metrics(y_true: list, y_pred: list) -> dict:
     """
     Computes standard classification evaluation metrics for hallucination detection:
-    F1, Precision, Recall, Accuracy, and AUROC (if sklearn available).
+    F1, Precision, Recall, Accuracy, False Negative Rate (FNR), ECE, and AUROC.
     """
     y_true_arr = np.array(y_true)
     y_pred_arr = np.array(y_pred)
@@ -21,6 +42,12 @@ def compute_detection_metrics(y_true: list, y_pred: list) -> dict:
     f1 = 2 * (precision * recall) / (precision + recall + 1e-12)
     accuracy = (tp + tn) / (tp + tn + fp + fn + 1e-12)
     
+    # Clinical Safety Metric: False Negative Rate (FNR)
+    fnr = fn / (tp + fn + 1e-12)
+    
+    # Expected Calibration Error (ECE)
+    ece = compute_ece(y_true_arr, y_pred_arr)
+    
     # Calculate AUROC safely
     auroc = 0.5
     try:
@@ -35,7 +62,9 @@ def compute_detection_metrics(y_true: list, y_pred: list) -> dict:
         "precision": float(precision),
         "recall": float(recall),
         "f1_score": float(f1),
-        "auroc": float(auroc)
+        "auroc": float(auroc),
+        "false_negative_rate": float(fnr),
+        "expected_calibration_error": float(ece)
     }
 
 def compute_pointing_iou(pred_patch_indices: list, gt_mask_image, grid_size: int = 14) -> float:
@@ -84,3 +113,26 @@ def compute_pointing_iou(pred_patch_indices: list, gt_mask_image, grid_size: int
     
     iou = intersection / (union + 1e-12)
     return float(iou)
+
+def compute_clinical_severity_weights(anatomy: str, question: str) -> float:
+    """
+    Computes a severity weight based on clinical priority:
+    - 1.0 (Critical pathology, e.g. lungs, pleural, heart, pneumothorax)
+    - 0.5 (Anatomical priority)
+    - 0.1 (Stylistic/Non-critical details)
+    """
+    anatomy_lower = str(anatomy).lower()
+    question_lower = str(question).lower()
+    
+    critical_keywords = [
+        "lung", "heart", "pleural", "pneumothorax", "chest", 
+        "effusion", "consolidation", "airway", "infiltration",
+        "nodule", "fracture", "mass", "cardiomegaly"
+    ]
+    
+    if any(k in anatomy_lower or k in question_lower for k in critical_keywords):
+        return 1.0
+    elif anatomy_lower and anatomy_lower != "none" and anatomy_lower != "nan":
+        return 0.5
+    else:
+        return 0.1

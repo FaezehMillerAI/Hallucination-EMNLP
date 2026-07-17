@@ -21,7 +21,7 @@ from src.detector.faithfulness import compute_custom_scores
 from src.mitigation.causal_reallocation import causal_reallocate_attention
 from src.explainability.explanation_graph import extract_minimal_subgraph
 from src.explainability.report_generator import generate_explainability_report
-from src.evaluation.metrics import compute_detection_metrics, compute_pointing_iou
+from src.evaluation.metrics import compute_detection_metrics, compute_pointing_iou, compute_clinical_severity_weights
 
 # RLE Helper (from quickstart)
 def rle_to_mask(rle_list, height, width):
@@ -258,6 +258,15 @@ def run():
     y_pred_hall = []
     pointing_ious = []
     
+    # Clinical and Mitigation tracking variables
+    total_claims_evaluated = 0
+    total_gt_hallucinations = 0
+    total_gt_safe = 0
+    mitigations_triggered_correctly = 0
+    mitigations_triggered_incorrectly = 0
+    total_clinical_risk = 0.0
+    correct_passes = 0
+    
     # Process and evaluate each sample
     for idx, sample in enumerate(tqdm(processed_samples, desc="Evaluating & Mitigating")):
         graph = evidence_graphs[idx].to(gnn_device)
@@ -277,6 +286,10 @@ def run():
         
         # B. Explainability: generate subgraphs and JSON reports
         os.makedirs("results/explanations", exist_ok=True)
+        raw_item = sample["raw_item"]
+        anatomy = raw_item.get("anatomy", "unknown")
+        question = raw_item.get("question", "")
+        
         for c_idx, claim in enumerate(sample["claims"]):
             subgraph = extract_minimal_subgraph(graph, c_idx)
             report = generate_explainability_report(claim, preds_cpu, c_idx, subgraph, sample["scores"][c_idx])
@@ -286,11 +299,33 @@ def run():
                 json.dump(report, f, indent=2)
                 
             # Log metrics
-            y_true_hall.append(1 if sample["scores"][c_idx]["visual_support"] < 0.25 else 0)
-            y_pred_hall.append(torch.sigmoid(preds_cpu["hallucination"])[c_idx].item())
+            is_hall_gt = 1 if sample["scores"][c_idx]["visual_support"] < 0.25 else 0
+            pred_prob = torch.sigmoid(preds_cpu["hallucination"])[c_idx].item()
+            is_hall_pred = 1 if pred_prob >= i_config["hallucination_threshold"] else 0
+            
+            y_true_hall.append(is_hall_gt)
+            y_pred_hall.append(pred_prob)
+            
+            # Calculate clinical severity weight
+            sev_w = compute_clinical_severity_weights(anatomy, question)
+            
+            # Track clinical outcomes
+            total_claims_evaluated += 1
+            if is_hall_gt == 1:
+                total_gt_hallucinations += 1
+                if is_hall_pred == 1:
+                    mitigations_triggered_correctly += 1
+                else:
+                    # Missed hallucination (False Negative): apply severity penalty
+                    total_clinical_risk += sev_w
+            else:
+                total_gt_safe += 1
+                if is_hall_pred == 1:
+                    mitigations_triggered_incorrectly += 1
+                else:
+                    correct_passes += 1
             
         # C. Pointing IoU against region mask
-        raw_item = sample["raw_item"]
         if raw_item["mask_rle"]:
             gt_mask = rle_to_mask(raw_item["mask_rle"], raw_item["mask_h"], raw_item["mask_w"])
             # Predict top supportive patch indices from first claim
@@ -304,11 +339,38 @@ def run():
     metrics = compute_detection_metrics(y_true_hall, y_pred_hall)
     mean_iou = np.mean(pointing_ious) if pointing_ious else 0.0
     
-    print("\n================== Aggregated Pipeline Results ==================")
-    print(f"Hallucination Detection F1-Score : {metrics['f1_score']:.4f}")
-    print(f"Hallucination Detection AUROC    : {metrics['auroc']:.4f}")
-    print(f"Localization Pointing IoU        : {mean_iou:.4f}")
-    print("==================================================================")
+    # Mitigation metrics
+    total_mitigations = mitigations_triggered_correctly + mitigations_triggered_incorrectly
+    mitigation_success_rate = mitigations_triggered_correctly / (total_mitigations + 1e-12)
+    mitigation_coverage = mitigations_triggered_correctly / (total_gt_hallucinations + 1e-12)
+    correct_preservation_rate = correct_passes / (total_gt_safe + 1e-12)
+    clinical_risk_index = total_clinical_risk / (total_claims_evaluated + 1e-12)
+    
+    print("\n" + "=" * 66)
+    print("                    KG-LESS PIPELINE METRICS SUITE")
+    print("=" * 66)
+    print(" 1. HALLUCINATION DETECTION PERFORMANCE")
+    print(f"    - Accuracy                       : {metrics['accuracy']:.4f}")
+    print(f"    - Precision                      : {metrics['precision']:.4f}")
+    print(f"    - Recall (Sensitivity)           : {metrics['recall']:.4f}")
+    print(f"    - F1-Score                       : {metrics['f1_score']:.4f}")
+    print(f"    - AUROC                          : {metrics['auroc']:.4f}")
+    print(f"    - Expected Calibration Error(ECE): {metrics['expected_calibration_error']:.4f}")
+    print("-" * 66)
+    print(" 2. EVIDENCE GROUNDING / LOCALIZATION")
+    print(f"    - Spatial Pointing IoU           : {mean_iou:.4f}")
+    print("-" * 66)
+    print(" 3. CLINICAL SAFETY AND RISK ASSESSMENT")
+    print(f"    - False Negative Rate (FNR)      : {metrics['false_negative_rate']:.4f}")
+    print(f"    - Clinical Severity Penalty Cost : {total_clinical_risk:.2f}")
+    print(f"    - Clinical Hallucination Risk (CHRI): {clinical_risk_index:.4f}")
+    print("-" * 66)
+    print(" 4. MITIGATION EFFECTIVENESS")
+    print(f"    - Total Mitigations Triggered    : {total_mitigations}")
+    print(f"    - Mitigation Precision (Success) : {mitigation_success_rate:.4f}")
+    print(f"    - Mitigation Recall (Coverage)   : {mitigation_coverage:.4f}")
+    print(f"    - Factual Quality Preservation   : {correct_preservation_rate:.4f}")
+    print("=" * 66)
     print("Explainability reports saved to: results/explanations/")
     print("Pipeline Execution Completed Successfully.")
 
