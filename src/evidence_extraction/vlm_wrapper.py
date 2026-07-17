@@ -133,9 +133,9 @@ class VLMWrapper:
             
         return {
             "logits": outputs.logits.detach().cpu(),
-            "hidden_states": tuple(h.detach().cpu() for h in outputs.hidden_states),
-            "attentions": tuple(a.detach().cpu() for a in attentions) if attentions else None,
-            "vision_embeddings": vision_embeddings.detach().cpu(),
+            "hidden_states": tuple(h.detach().cpu() for h in outputs.hidden_states if h is not None),
+            "attentions": tuple(a.detach().cpu() for a in attentions if a is not None) if attentions else None,
+            "vision_embeddings": vision_embeddings.detach().cpu() if hasattr(vision_embeddings, "detach") else vision_embeddings,
             "tokens": tokens
         }
 
