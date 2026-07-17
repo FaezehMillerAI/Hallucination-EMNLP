@@ -131,11 +131,39 @@ class VLMWrapper:
         if attentions is None and hasattr(outputs, "decoder_attentions"):
             attentions = outputs.decoder_attentions
             
+        # Sanitise all outputs against NaN/Inf overflows (common in float16 on T4 GPUs)
+        logits = outputs.logits.detach().cpu()
+        if torch.isnan(logits).any() or torch.isinf(logits).any():
+            logits = torch.nan_to_num(logits, nan=0.0, posinf=1e4, neginf=-1e4)
+            
+        hidden_states = []
+        for h in outputs.hidden_states:
+            if h is not None:
+                h_cpu = h.detach().cpu()
+                if torch.isnan(h_cpu).any() or torch.isinf(h_cpu).any():
+                    h_cpu = torch.nan_to_num(h_cpu, nan=0.0, posinf=1e4, neginf=-1e4)
+                hidden_states.append(h_cpu)
+                
+        cleaned_attentions = None
+        if attentions:
+            cleaned_attentions = []
+            for a in attentions:
+                if a is not None:
+                    a_cpu = a.detach().cpu()
+                    if torch.isnan(a_cpu).any() or torch.isinf(a_cpu).any():
+                        a_cpu = torch.nan_to_num(a_cpu, nan=0.0, posinf=1.0, neginf=0.0)
+                    cleaned_attentions.append(a_cpu)
+            cleaned_attentions = tuple(cleaned_attentions)
+            
+        v_embed = vision_embeddings.detach().cpu() if hasattr(vision_embeddings, "detach") else vision_embeddings
+        if torch.isnan(v_embed).any() or torch.isinf(v_embed).any():
+            v_embed = torch.nan_to_num(v_embed, nan=0.0, posinf=1e4, neginf=-1e4)
+            
         return {
-            "logits": outputs.logits.detach().cpu(),
-            "hidden_states": tuple(h.detach().cpu() for h in outputs.hidden_states if h is not None),
-            "attentions": tuple(a.detach().cpu() for a in attentions if a is not None) if attentions else None,
-            "vision_embeddings": vision_embeddings.detach().cpu() if hasattr(vision_embeddings, "detach") else vision_embeddings,
+            "logits": logits,
+            "hidden_states": tuple(hidden_states),
+            "attentions": cleaned_attentions,
+            "vision_embeddings": v_embed,
             "tokens": tokens
         }
 
